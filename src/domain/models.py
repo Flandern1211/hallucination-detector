@@ -29,7 +29,8 @@ _PROMPT_URL = re.compile(r"(?i)(?:https?|ftp)://|\bwww\.")
 _PROMPT_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|(?:^|\s)(?:\.\.[\\/]|/[A-Za-z0-9._-]))")
 _PROMPT_EXECUTABLE = re.compile(
     r"(?i)```|<script\b|#!|\$\(|&&|\|\||"
-    r"(?:^|\s)(?:powershell|cmd(?:\.exe)?|bash|sh|python)(?:\s|$)"
+    r"(?:^|[\r\n])\s*(?:powershell|cmd(?:\.exe)?|bash|sh|python)\s+"
+    r"(?:-|/|[A-Za-z0-9_.]+\.py\b)"
 )
 
 T = TypeVar("T")
@@ -111,8 +112,8 @@ def _require_non_blank(value: str, field_name: str) -> str:
 def _validate_system_prompt(value: str) -> str:
     if not value.strip():
         raise ValueError("prompt must not be blank")
-    if "UNTRUSTED_DATA" not in value:
-        raise ValueError("prompt must contain the UNTRUSTED_DATA boundary marker")
+    if "UNTRUSTED_DATA" not in value and "数据而非指令" not in value:
+        raise ValueError("prompt must define an untrusted-data boundary")
     if _PROMPT_TEMPLATE.search(value):
         raise ValueError("prompt must not contain template or runtime placeholders")
     if _PROMPT_URL.search(value):

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from importlib.resources import files
 import json
 from typing import Any, cast
 
@@ -24,6 +25,15 @@ from src.domain.models import (
     SuccessfulPrediction,
     SuggestionReport,
 )
+
+
+def test_baseline_config_accepts_the_shipped_read_only_resource() -> None:
+    payload = files("src.resources").joinpath("detectors/baseline.json").read_text(encoding="utf-8")
+
+    config = BaselineDetectorConfig.model_validate_json(payload)
+
+    assert config.version == "baseline-v1"
+
 
 _SHA256 = "a" * 64
 
