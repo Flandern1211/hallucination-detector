@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "version": "task4-risk-v1",
+  "source": "frozen_benchmark_map",
+  "ground_truth_hash": "1592aa34f68b4042f65f9a6768ffd23194c858abb61517f935b4e9fc29213fe7",
+  "risk_rule_version": "risk-v1",
+  "severity_by_positive_id": {
+    "h01": "中", "h02": "中", "h03": "中", "h04": "中", "h05": "高",
+    "h06": "中", "h07": "高", "h08": "中", "h09": "中", "h10": "中",
+    "h11": "中", "h13": "高", "h14": "高", "h15": "中", "h17": "中",
+    "h18": "高", "h19": "中", "h20": "中"
+  },
+  "content_hash": "76ce5874e24e0ba1fc6b0293089d29750357e6606428e6acaecf31908e61c555"
+}
