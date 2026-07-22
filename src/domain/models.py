@@ -409,6 +409,26 @@ class BatchDetectionResult(StrictModel):
         return self
 
 
+class ProgressEvent(StrictModel):
+    record_id: str
+    completed_count: Annotated[int, Field(ge=1)]
+    total_count: Annotated[int, Field(ge=1)]
+    outcome: Literal["success", "failure"]
+
+    @field_validator("record_id", mode="before")
+    @classmethod
+    def normalize_record_id(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("record_id must be a string")
+        return normalize_stable_id(value)
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> ProgressEvent:
+        if self.completed_count > self.total_count:
+            raise ValueError("completed_count must not exceed total_count")
+        return self
+
+
 class DetectionRunConfig(StrictModel):
     detector_version: Literal["baseline-v1"]
     manual_review_enabled: bool = False
@@ -543,6 +563,39 @@ class BaselineDetectorConfig(StrictModel):
         return self
 
 
+class ErrorAnalysisInput(StrictModel):
+    case_ref: str
+    error_kind: Literal["false_negative", "false_positive"]
+    user_question: ReplyText
+    system_reply: ReplyText
+    knowledge_base: KnowledgeText
+    prediction: ClassificationResult
+    expected_is_hallucination: bool
+    expected_labels: FrozenSequence[HallucinationType]
+
+    @field_validator("case_ref")
+    @classmethod
+    def validate_case_ref(cls, value: str) -> str:
+        return _validate_generated_id(value)
+
+    @field_validator("expected_labels")
+    @classmethod
+    def normalize_expected_labels(cls, value: list[HallucinationType]) -> list[HallucinationType]:
+        return _ordered_unique_labels(value)
+
+    @model_validator(mode="after")
+    def validate_error_kind(self) -> ErrorAnalysisInput:
+        if self.expected_is_hallucination != bool(self.expected_labels):
+            raise ValueError("expected labels must match expected_is_hallucination")
+        is_false_negative = self.expected_is_hallucination and not self.prediction.is_hallucination
+        is_false_positive = not self.expected_is_hallucination and self.prediction.is_hallucination
+        if self.error_kind == "false_negative" and not is_false_negative:
+            raise ValueError("false_negative input must contain a false-negative prediction")
+        if self.error_kind == "false_positive" and not is_false_positive:
+            raise ValueError("false_positive input must contain a false-positive prediction")
+        return self
+
+
 ErrorReason: TypeAlias = Literal[
     "claim_not_extracted",
     "evidence_misread",
@@ -601,6 +654,22 @@ class FailedErrorAnalysis(StrictModel):
 ErrorAnalysis: TypeAlias = Annotated[
     SuccessfulErrorAnalysis | FailedErrorAnalysis, Field(discriminator="kind")
 ]
+
+
+class ExperimentalSuggestionBody(StrictModel):
+    category: Literal["prompt_principle", "label_boundary", "generalized_example"]
+    target_stage: Literal["claim_extraction", "evidence_judgement", "completeness_check"]
+    rationale: SummaryText
+    proposed_change: SummaryText
+    known_risks: Annotated[FrozenSequence[RiskText], Field(min_length=1, max_length=10)]
+
+    @model_validator(mode="after")
+    def require_suggestion_content(self) -> ExperimentalSuggestionBody:
+        _require_non_blank(self.rationale, "rationale")
+        _require_non_blank(self.proposed_change, "proposed_change")
+        for risk in self.known_risks:
+            _require_non_blank(risk, "known_risks item")
+        return self
 
 
 class ExperimentalSuggestion(StrictModel):
