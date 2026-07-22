@@ -22,10 +22,14 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+exclude = ["*.__pycache__"]
 
 [tool.setuptools.package-data]
-"src.api" = ["templates/**/*.html", "static/**/*"]
+"src.api" = ["templates/**/*.html", "static/vendor/**/*"]
 "src.resources" = ["detectors/*.json", "evaluation/*.json", "vendor_hashes.json"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/*", "**/*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
