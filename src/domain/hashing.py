@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -6,7 +6,7 @@ from typing import Any
 
 
 def canonical_bytes(value: Any, exclude: frozenset[str] = frozenset()) -> bytes:
-    raw = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+    raw = _json_value(value)
     if isinstance(raw, Mapping):
         raw = {key: item for key, item in raw.items() if key not in exclude}
     return json.dumps(
@@ -16,6 +16,16 @@ def canonical_bytes(value: Any, exclude: frozenset[str] = frozenset()) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _json_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return _json_value(value.model_dump(mode="json"))
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_value(item) for item in value]
+    return value
 
 
 def content_hash(value: Any, exclude: frozenset[str] = frozenset()) -> str:

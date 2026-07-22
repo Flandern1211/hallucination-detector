@@ -145,7 +145,9 @@ def _utc_z(value: datetime) -> str:
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="never"
+    )
 
     @model_validator(mode="after")
     def reject_illegal_control_characters(self) -> StrictModel:
@@ -449,6 +451,37 @@ class HumanReviewRevision(StrictModel):
     created_at_utc: datetime
     previous_event_hash: Sha256Hex | None
     event_hash: Sha256Hex
+
+    @field_validator("reviewed_result", mode="before")
+    @classmethod
+    def parse_reviewed_result(cls, value: Any) -> ClassificationResult:
+        if isinstance(value, ClassificationResult):
+            return value
+        if isinstance(value, Mapping):
+            data = dict(value)
+            data["labels"] = [HallucinationType(label) for label in data.get("labels", [])]
+            if data.get("primary_type") is not None:
+                data["primary_type"] = HallucinationType(data["primary_type"])
+            if data.get("severity") is not None:
+                data["severity"] = Severity(data["severity"])
+            claims = []
+            for claim in data.get("claims", []):
+                claim_data = dict(claim)
+                claim_data["labels"] = [
+                    HallucinationType(label) for label in claim_data.get("labels", [])
+                ]
+                if claim_data.get("severity") is not None:
+                    claim_data["severity"] = Severity(claim_data["severity"])
+                claims.append(claim_data)
+            data["claims"] = claims
+            omissions = []
+            for omission in data.get("omissions", []):
+                omission_data = dict(omission)
+                omission_data["severity"] = Severity(omission_data["severity"])
+                omissions.append(omission_data)
+            data["omissions"] = omissions
+            return ClassificationResult.model_validate(data)
+        return cast(ClassificationResult, value)
 
     @field_validator("record_id", mode="before")
     @classmethod

@@ -4,6 +4,7 @@ import math
 import pytest
 
 from src.domain.hashing import canonical_bytes, content_hash, utc_now
+from src.domain.models import GroundTruthRecord
 
 
 def test_canonical_hash_ignores_key_order_and_excluded_self_hash() -> None:
@@ -30,3 +31,11 @@ def test_content_hash_is_lowercase_sha256_and_utc_now_is_aware() -> None:
     assert digest == digest.lower()
     assert set(digest) <= set("0123456789abcdef")
     assert utc_now().tzinfo is UTC
+
+
+def test_canonical_hash_recursively_serializes_models_in_sequences() -> None:
+    record = GroundTruthRecord(
+        id="h01", is_hallucination=False, hallucination_type=None, detail="normal"
+    )
+
+    assert content_hash((record,)) == content_hash([record.model_dump(mode="json")])

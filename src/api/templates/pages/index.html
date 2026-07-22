@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>客服幻觉检测</title>
+    <link rel="stylesheet" href="/static/css/app.css">
+    <script src="/static/vendor/htmx-2.0.10/htmx.min.js" defer></script>
+    <script src="/static/vendor/echarts-5.5.1/echarts.min.js" defer></script>
+    <script src="/static/js/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <h1>客服幻觉检测</h1>
+      <section class="panel">
+        <h2>运行配置</h2>
+        <p>LLM 配置只从环境变量读取；页面不显示密钥值。</p>
+        <label><input type="checkbox" name="manual_review_enabled"> 开启人工复审</label>
+        <label><input type="checkbox" name="external_processing_acknowledged" required> 我确认所选内容将发送到配置的外部 LLM 服务</label>
+      </section>
+      <section id="run-summary" class="panel" aria-live="polite">尚未创建运行</section>
+      <section id="progress" class="panel" aria-live="polite">尚未开始检测</section>
+      <section id="results" class="panel">尚未生成结果</section>
+      <section id="evaluation" class="panel">尚未生成评测</section>
+      <section id="suggestions" class="panel">尚未生成实验性建议</section>
+      <section id="exports" class="panel">导出将在生成后可用</section>
+    </main>
+  </body>
+</html>
