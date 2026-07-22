@@ -251,3 +251,40 @@ def test_omission_forces_hallucination_and_its_label_into_the_union() -> None:
         summary="有关键遗漏",
     )
     assert result.labels == [HallucinationType("关键遗漏或歪曲")]
+
+
+def test_classification_rejects_duplicate_claim_ids() -> None:
+    with pytest.raises(ValidationError, match="claim_id"):
+        ClassificationResult(
+            is_hallucination=False,
+            labels=[],
+            primary_type=None,
+            severity=None,
+            review_required=False,
+            claims=[_supported(), _supported()],
+            omissions=[],
+            summary="duplicate claim ids",
+        )
+
+
+def test_classification_rejects_duplicate_omission_ids() -> None:
+    omission = OmissionFinding(
+        omission_id="h01-o01",
+        missing_fact="需要保留包装",
+        label="关键遗漏或歪曲",
+        severity=Severity("高"),
+        evidence=_evidence(),
+        core_relevance="high",
+        reason="遗漏重要条件",
+    )
+    with pytest.raises(ValidationError, match="omission_id"):
+        ClassificationResult(
+            is_hallucination=True,
+            labels=[HallucinationType("关键遗漏或歪曲")],
+            primary_type=HallucinationType("关键遗漏或歪曲"),
+            severity=Severity("高"),
+            review_required=False,
+            claims=[],
+            omissions=[omission, omission],
+            summary="duplicate omission ids",
+        )

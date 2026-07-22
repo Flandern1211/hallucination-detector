@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import pytest
 from pydantic import ValidationError
 
@@ -59,7 +61,7 @@ def test_risk_reference_hash_excludes_its_own_hash_field() -> None:
         "schema_version": "1.0",
         "version": "risk-v1",
         "source": "uploaded_ground_truth",
-        "ground_truth_hash": "ground-truth-hash",
+        "ground_truth_hash": "a" * 64,
         "risk_rule_version": "risk-rule-v1",
         "severity_by_positive_id": {"h01": "高"},
     }
@@ -80,3 +82,7 @@ def test_risk_reference_hash_excludes_its_own_hash_field() -> None:
                 ensure_ascii=False,
             )
         )
+
+    assert isinstance(reference.model_dump(mode="json")["severity_by_positive_id"], dict)
+    with pytest.raises(TypeError):
+        cast(Any, reference.severity_by_positive_id)["h02"] = Severity("中")

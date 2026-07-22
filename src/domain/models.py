@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 import re
-from typing import Annotated, Any, Literal, TypeAlias
+from types import MappingProxyType
+from typing import Annotated, Any, Literal, TypeAlias, TypeVar, cast
 
 from pydantic import (
     BaseModel,
+    AfterValidator,
     ConfigDict,
     Field,
+    PlainSerializer,
     field_serializer,
     field_validator,
     model_validator,
@@ -21,6 +24,46 @@ from src.domain.hashing import content_hash
 _ILLEGAL_C0 = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _STABLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _LABEL_ORDER = {label: index for index, label in enumerate(HallucinationType)}
+_PROMPT_TEMPLATE = re.compile(r"\{\{|\}\}|\{%|%\}|<%|%>|\$\{|\{[A-Za-z_][^{}\r\n]*\}")
+_PROMPT_URL = re.compile(r"(?i)(?:https?|ftp)://|\bwww\.")
+_PROMPT_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|(?:^|\s)(?:\.\.[\\/]|/[A-Za-z0-9._-]))")
+_PROMPT_EXECUTABLE = re.compile(
+    r"(?i)```|<script\b|#!|\$\(|&&|\|\||"
+    r"(?:^|\s)(?:powershell|cmd(?:\.exe)?|bash|sh|python)(?:\s|$)"
+)
+
+T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class _ImmutableSequence(tuple[Any, ...]):
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+def _freeze_list(value: list[T]) -> list[T]:
+    return cast(list[T], _ImmutableSequence(value))
+
+
+def _freeze_mapping(value: Mapping[K, V]) -> Mapping[K, V]:
+    return MappingProxyType(dict(value))
+
+
+FrozenSequence: TypeAlias = Annotated[
+    list[T],
+    AfterValidator(_freeze_list),
+    PlainSerializer(lambda value: list(value), return_type=list),
+]
+FrozenMapping: TypeAlias = Annotated[
+    Mapping[K, V],
+    AfterValidator(_freeze_mapping),
+    PlainSerializer(lambda value: dict(value), return_type=dict),
+]
 
 ShortText = Annotated[str, Field(max_length=2_000)]
 ClaimText = Annotated[str, Field(max_length=5_000)]
@@ -28,6 +71,7 @@ SummaryText = Annotated[str, Field(max_length=4_000)]
 ReplyText = Annotated[str, Field(max_length=10_000)]
 KnowledgeText = Annotated[str, Field(max_length=50_000)]
 RiskText = Annotated[str, Field(max_length=1_000)]
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 def _reject_illegal_c0(value: Any) -> None:
@@ -64,8 +108,29 @@ def _require_non_blank(value: str, field_name: str) -> str:
     return value
 
 
-def _ordered_unique_labels(labels: list[HallucinationType]) -> list[HallucinationType]:
-    return sorted(set(labels), key=_LABEL_ORDER.__getitem__)
+def _validate_system_prompt(value: str) -> str:
+    if not value.strip():
+        raise ValueError("prompt must not be blank")
+    if "UNTRUSTED_DATA" not in value:
+        raise ValueError("prompt must contain the UNTRUSTED_DATA boundary marker")
+    if _PROMPT_TEMPLATE.search(value):
+        raise ValueError("prompt must not contain template or runtime placeholders")
+    if _PROMPT_URL.search(value):
+        raise ValueError("prompt must not contain a URL")
+    if _PROMPT_PATH.search(value):
+        raise ValueError("prompt must not contain a file path")
+    if _PROMPT_EXECUTABLE.search(value):
+        raise ValueError("prompt must not contain executable code or command syntax")
+    return value
+
+
+def _ordered_unique_labels(
+    labels: Sequence[HallucinationType],
+) -> list[HallucinationType]:
+    return cast(
+        list[HallucinationType],
+        _ImmutableSequence(sorted(set(labels), key=_LABEL_ORDER.__getitem__)),
+    )
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -156,7 +221,7 @@ def validate_evidence_quote(evidence: EvidenceReference, knowledge_base: str) ->
 class ClaimJudgement(StrictModel):
     claim: Claim
     verdict: Literal["supported", "contradicted", "unsupported", "unverifiable"]
-    labels: list[HallucinationType]
+    labels: FrozenSequence[HallucinationType]
     severity: Severity | None
     evidence: EvidenceReference | None
     core_relevance: Literal["high", "medium", "low"]
@@ -199,12 +264,12 @@ class OmissionFinding(StrictModel):
 
 class ClassificationResult(StrictModel):
     is_hallucination: bool
-    labels: list[HallucinationType]
+    labels: FrozenSequence[HallucinationType]
     primary_type: HallucinationType | None
     severity: Severity | None
     review_required: bool
-    claims: Annotated[list[ClaimJudgement], Field(max_length=10)]
-    omissions: list[OmissionFinding]
+    claims: Annotated[FrozenSequence[ClaimJudgement], Field(max_length=10)]
+    omissions: FrozenSequence[OmissionFinding]
     summary: SummaryText
 
     @field_validator("labels")
@@ -214,6 +279,13 @@ class ClassificationResult(StrictModel):
 
     @model_validator(mode="after")
     def validate_classification(self) -> ClassificationResult:
+        claim_ids = [judgement.claim.claim_id for judgement in self.claims]
+        if len(claim_ids) != len(set(claim_ids)):
+            raise ValueError("claim_id values must be unique within a classification")
+        omission_ids = [omission.omission_id for omission in self.omissions]
+        if len(omission_ids) != len(set(omission_ids)):
+            raise ValueError("omission_id values must be unique within a classification")
+
         component_labels = [label for judgement in self.claims for label in judgement.labels]
         component_labels.extend(
             HallucinationType.critical_omission_or_distortion for _ in self.omissions
@@ -258,6 +330,15 @@ PredictionErrorCode: TypeAlias = Literal[
     "run_deadline_exceeded",
 ]
 
+_ZERO_ATTEMPT_ERROR_CODES = frozenset(
+    {
+        "request_budget_exhausted",
+        "token_budget_exhausted",
+        "cancelled",
+        "run_deadline_exceeded",
+    }
+)
+
 
 class SuccessfulPrediction(StrictModel):
     kind: Literal["success"]
@@ -266,7 +347,7 @@ class SuccessfulPrediction(StrictModel):
     engine: Literal["llm"]
     model_name: str
     detector_version: str
-    config_hash: str
+    config_hash: Sha256Hex
     attempt_count: Annotated[int, Field(ge=1)]
 
     @field_validator("id", mode="before")
@@ -292,6 +373,12 @@ class FailedPrediction(StrictModel):
             raise ValueError("id must be a string")
         return normalize_stable_id(value)
 
+    @model_validator(mode="after")
+    def validate_attempt_count_for_error(self) -> FailedPrediction:
+        if self.attempt_count == 0 and self.error_code not in _ZERO_ATTEMPT_ERROR_CODES:
+            raise ValueError(f"attempt_count must be at least 1 for {self.error_code!r}")
+        return self
+
 
 PredictionResult: TypeAlias = Annotated[
     SuccessfulPrediction | FailedPrediction, Field(discriminator="kind")
@@ -306,9 +393,9 @@ class ProviderUsage(StrictModel):
 
 class BatchDetectionResult(StrictModel):
     schema_version: Literal["1.0"]
-    results: Annotated[list[PredictionResult], Field(min_length=1, max_length=20)]
-    input_hash: str
-    detector_config_hash: str
+    results: Annotated[FrozenSequence[PredictionResult], Field(min_length=1, max_length=20)]
+    input_hash: Sha256Hex
+    detector_config_hash: Sha256Hex
     network_attempt_count: Annotated[int, Field(ge=0)]
     provider_usage: ProviderUsage
     stopped_reason: str | None
@@ -333,14 +420,14 @@ class HumanReviewRevision(StrictModel):
     run_id: str
     record_id: str
     status: Literal["confirmed_correct", "corrected"]
-    source_prediction_hash: str
+    source_prediction_hash: Sha256Hex
     reviewed_result: ClassificationResult
-    changed_fields: list[str]
+    changed_fields: FrozenSequence[str]
     revision_number: Annotated[int, Field(ge=1)]
     save_request_id: str
     created_at_utc: datetime
-    previous_event_hash: str | None
-    event_hash: str
+    previous_event_hash: Sha256Hex | None
+    event_hash: Sha256Hex
 
     @field_validator("record_id", mode="before")
     @classmethod
@@ -400,14 +487,14 @@ class RiskReference(StrictModel):
     schema_version: Literal["1.0"]
     version: str
     source: Literal["uploaded_ground_truth", "frozen_benchmark_map"]
-    ground_truth_hash: str
+    ground_truth_hash: Sha256Hex
     risk_rule_version: str
-    severity_by_positive_id: dict[str, Severity]
-    content_hash: str
+    severity_by_positive_id: FrozenMapping[str, Severity]
+    content_hash: Sha256Hex
 
     @field_validator("severity_by_positive_id")
     @classmethod
-    def validate_positive_ids(cls, value: dict[str, Severity]) -> dict[str, Severity]:
+    def validate_positive_ids(cls, value: Mapping[str, Severity]) -> Mapping[str, Severity]:
         for record_id in value:
             if normalize_stable_id(record_id) != record_id:
                 raise ValueError("severity_by_positive_id keys must be normalized stable ids")
@@ -429,11 +516,22 @@ class BaselineDetectorConfig(StrictModel):
     completeness_check_system_prompt: str
     error_analysis_system_prompt: str
     suggestion_system_prompt: str
-    hallucination_type_definitions: dict[HallucinationType, str]
-    severity_definitions: dict[Severity, str]
+    hallucination_type_definitions: FrozenMapping[HallucinationType, str]
+    severity_definitions: FrozenMapping[Severity, str]
     max_claims: Literal[10]
     temperature: Literal[0]
     provider_response_schema_version: Literal["1.0"]
+
+    @field_validator(
+        "claim_extraction_system_prompt",
+        "evidence_judgement_system_prompt",
+        "completeness_check_system_prompt",
+        "error_analysis_system_prompt",
+        "suggestion_system_prompt",
+    )
+    @classmethod
+    def validate_system_prompt(cls, value: str) -> str:
+        return _validate_system_prompt(value)
 
     @model_validator(mode="after")
     def validate_definition_keys(self) -> BaselineDetectorConfig:
@@ -474,14 +572,14 @@ class SuccessfulErrorAnalysis(StrictModel):
     case_ref: str
     error_kind: Literal["false_negative", "false_positive"]
     primary_reason: ErrorReason
-    secondary_reasons: list[ErrorReason]
+    secondary_reasons: FrozenSequence[ErrorReason]
     evidence: SummaryText
     proposed_improvement: SummaryText
 
     @field_validator("secondary_reasons")
     @classmethod
     def deduplicate_secondary_reasons(cls, value: list[ErrorReason]) -> list[ErrorReason]:
-        return list(dict.fromkeys(value))
+        return cast(list[ErrorReason], _ImmutableSequence(dict.fromkeys(value)))
 
     @model_validator(mode="after")
     def validate_error_analysis(self) -> SuccessfulErrorAnalysis:
@@ -510,7 +608,7 @@ class ExperimentalSuggestion(StrictModel):
     target_stage: Literal["claim_extraction", "evidence_judgement", "completeness_check"]
     rationale: SummaryText
     proposed_change: SummaryText
-    known_risks: Annotated[list[RiskText], Field(min_length=1, max_length=10)]
+    known_risks: Annotated[FrozenSequence[RiskText], Field(min_length=1, max_length=10)]
 
     @model_validator(mode="after")
     def require_suggestion_content(self) -> ExperimentalSuggestion:
@@ -525,16 +623,16 @@ class SuggestionReport(StrictModel):
     schema_version: Literal["1.0"]
     run_id: str
     label_source: Literal["official_ground_truth", "human_revision"]
-    input_hash: str
-    prediction_hash: str
+    input_hash: Sha256Hex
+    prediction_hash: Sha256Hex
     detector_version: Literal["baseline-v1"]
-    detector_config_hash: str
+    detector_config_hash: Sha256Hex
     model_name: str
     generated_at_utc: datetime
     coverage: Annotated[float, Field(ge=0.0, le=1.0)]
     warning: Literal["小样本实验性建议，不代表效果提升"]
-    analyses: list[SuccessfulErrorAnalysis]
-    suggestions: Annotated[list[ExperimentalSuggestion], Field(max_length=20)]
+    analyses: FrozenSequence[SuccessfulErrorAnalysis]
+    suggestions: Annotated[FrozenSequence[ExperimentalSuggestion], Field(max_length=20)]
 
     @field_validator("generated_at_utc")
     @classmethod
