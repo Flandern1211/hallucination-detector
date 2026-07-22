@@ -23,7 +23,7 @@ def test_package_data_excludes_python_bytecode() -> None:
     ]
     assert config["tool"]["setuptools"]["package-data"]["src.api"] == [
         "templates/**/*.html",
-        "static/vendor/**/*",
+        "static/**/*",
     ]
     assert config["tool"]["setuptools"]["exclude-package-data"]["*"] == [
         "**/__pycache__/*",

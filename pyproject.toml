@@ -25,7 +25,7 @@ include = ["src*"]
 exclude = ["*.__pycache__"]
 
 [tool.setuptools.package-data]
-"src.api" = ["templates/**/*.html", "static/vendor/**/*"]
+"src.api" = ["templates/**/*.html", "static/**/*"]
 "src.resources" = ["detectors/*.json", "evaluation/*.json", "vendor_hashes.json"]
 
 [tool.setuptools.exclude-package-data]
