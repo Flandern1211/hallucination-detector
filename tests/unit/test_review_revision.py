@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, cast
 
 import pytest
@@ -24,6 +26,8 @@ from src.domain.models import (
     SuccessfulPrediction,
 )
 from src.infrastructure.run_registry import RunRecord, RunRegistry
+from src.infrastructure.artifact_store import ArtifactStore
+from src.application.reporting_service import ReportingService
 from src.review.revision_store import RevisionStore
 
 
@@ -81,7 +85,10 @@ def _corrected_result() -> ClassificationResult:
 
 
 def _service(
-    *, enabled: bool = True, failed: bool = False
+    *,
+    enabled: bool = True,
+    failed: bool = False,
+    artifact_store: ArtifactStore | None = None,
 ) -> tuple[ReviewService, RunRecord, SuccessfulPrediction | FailedPrediction]:
     registry = RunRegistry(uuid_factory=lambda: "run-1")
     record = ReplyRecord(
@@ -127,6 +134,7 @@ def _service(
         RevisionStore(),
         uuid_factory=iter(["review-1", "review-2", "review-3"]).__next__,
         clock=lambda: datetime(2026, 7, 23, 1, 2, 3, tzinfo=UTC),
+        artifact_store=artifact_store,
     )
     return service, run, prediction
 
@@ -259,3 +267,17 @@ def test_restore_is_new_monotonic_event_and_snapshot_excludes_failures() -> None
     assert snapshot.total_success_count == 1
     assert snapshot.unreviewed_ids == []
     assert snapshot.current_revisions == [restored]
+
+
+def test_review_save_persists_isolated_feedback_export(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "runtime")
+    service, run, prediction = _service(artifact_store=store)
+    assert isinstance(prediction, SuccessfulPrediction)
+
+    service.save(run.id, "h01", _request("save-1", prediction))
+
+    exported = json.loads(store.export_path(run.id, "feedback.json").read_text("utf-8"))
+    assert exported["source"] == "human_revision"
+    assert exported["reviewed_success_count"] == 1
+    assert exported["total_success_count"] == 1
+    ReportingService().validate_export(exported)

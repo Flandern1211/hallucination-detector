@@ -22,6 +22,7 @@ from src.suggestions.error_analyzer import (
     validate_analyses,
 )
 from src.suggestions.validator import validate_suggestions
+from src.reporting.exporter import export_suggestions
 from threading import Event
 import time
 
@@ -143,6 +144,11 @@ class SuggestionService:
         )
         self._artifact_store.write_json(
             run_id, "suggestions/suggestion_report.json", report.model_dump(mode="json")
+        )
+        self._artifact_store.write_json(
+            run_id,
+            "suggestions.json",
+            export_suggestions(report.model_dump(mode="json")),
         )
         self._reports[run_id] = report
         return SuggestionTaskSummary(run_id, "completed")

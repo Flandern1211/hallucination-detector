@@ -18,9 +18,12 @@ from src.domain.models import (
     validate_claim_quote,
     validate_evidence_quote,
 )
+from src.infrastructure.artifact_store import ArtifactStore
 from src.infrastructure.run_registry import RunRecord, RunRegistry
+from src.reporting.exporter import export_feedback
 from src.review.diff import model_equal
 from src.review.revision_store import RevisionStore
+from src.suggestions.error_analyzer import HumanRevisionSource
 
 
 class ReviewDisabled(RuntimeError):
@@ -65,11 +68,13 @@ class ReviewService:
         *,
         uuid_factory: Callable[[], object] = uuid4,
         clock: Callable[[], datetime] = utc_now,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._registry = registry
         self._revisions = revisions
         self._uuid_factory = uuid_factory
         self._clock = clock
+        self._artifact_store = artifact_store
 
     def save(self, run_id: str, record_id: str, request: ReviewSaveRequest) -> HumanReviewRevision:
         run = self._registry.get(run_id)
@@ -85,7 +90,7 @@ class ReviewService:
         ):
             raise ConfirmedResultMismatch(record_id)
         reviewed_result = self._validate_result(run, record_id, request.reviewed_result)
-        return self._revisions.append(
+        revision = self._revisions.append(
             run_id=run_id,
             record_id=record_id,
             prediction=prediction,
@@ -95,6 +100,8 @@ class ReviewService:
             review_id_factory=lambda: str(self._uuid_factory()),
             clock=self._clock,
         )
+        self._persist_feedback(run_id)
+        return revision
 
     def restore_original(
         self,
@@ -132,6 +139,34 @@ class ReviewService:
             current_revisions=[
                 by_record[record_id] for record_id in success_ids if record_id in by_record
             ],
+        )
+
+    def human_source(self, run_id: str) -> HumanRevisionSource:
+        snapshot = self.review_snapshot(run_id)
+        return HumanRevisionSource(
+            revisions=tuple(snapshot.current_revisions),
+            total_success_count=snapshot.total_success_count,
+            reviewed_success_count=snapshot.reviewed_success_count,
+        )
+
+    def _persist_feedback(self, run_id: str) -> None:
+        if self._artifact_store is None:
+            return
+        snapshot = self.review_snapshot(run_id)
+        self._artifact_store.write_json(
+            run_id,
+            "feedback.json",
+            export_feedback(
+                {
+                    "run_id": snapshot.run_id,
+                    "reviewed_success_count": snapshot.reviewed_success_count,
+                    "total_success_count": snapshot.total_success_count,
+                    "unreviewed_ids": snapshot.unreviewed_ids,
+                    "current_revisions": [
+                        revision.model_dump(mode="json") for revision in snapshot.current_revisions
+                    ],
+                }
+            ),
         )
 
     def _success_prediction(self, run: RunRecord, record_id: str) -> SuccessfulPrediction:

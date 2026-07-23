@@ -129,8 +129,7 @@ def test_chat_completion_wire_contract_and_usage() -> None:
     assert sent.json["temperature"] == 0
     assert sent.json["stream"] is False
     assert sent.json["max_tokens"] == 2000
-    assert sent.json["response_format"]["json_schema"]["name"] == "extract_claims"
-    assert sent.json["response_format"]["json_schema"]["strict"] is True
+    assert sent.json["response_format"] == {"type": "json_object"}
     assert "UNTRUSTED_DATA" in sent.json["messages"][1]["content"]
     assert transport.limits == [(60.0, 2 * 1024 * 1024)]
     assert result.usage.total_tokens >= result.usage.prompt_tokens + result.usage.completion_tokens
@@ -336,3 +335,119 @@ def test_provider_call_result_models_remain_strict() -> None:
                 "extra": 1,
             }
         )
+
+
+def test_response_format_unavailable_falls_back_to_plain_json() -> None:
+    rejected = HttpResponse(
+        400, {}, b'{"error":{"message":"This response_format type is unavailable now"}}'
+    )
+    transport = ScriptedTransport([rejected, _ok_response(_claims_payload())])
+
+    result = LLMProvider(_provider_config(), transport, lambda _: None).extract_claims(
+        _record(), _config(), _budget()
+    )
+
+    assert result.attempts == 2
+    assert "response_format" not in transport.requests[1].json
+
+
+def test_all_models_use_openai_compatible_json_mode() -> None:
+    transport = ScriptedTransport([_ok_response(_claims_payload())])
+    config = ProviderConfig.from_environment(
+        {
+            "HALLUCINATION_API_KEY": "test-only-secret",
+            "HALLUCINATION_BASE_URL": "https://provider.example/v1/",
+            "HALLUCINATION_MODEL": "deepseek-v4-flash",
+        }
+    )
+
+    LLMProvider(config, transport, lambda _: None).extract_claims(_record(), _config(), _budget())
+
+    assert transport.requests[0].json["response_format"] == {"type": "json_object"}
+
+
+def test_domain_quote_offset_is_canonicalized_without_repair() -> None:
+    invalid: dict[str, Any] = {
+        "verdict": "contradicted",
+        "labels": ["知识冲突"],
+        "severity": "高",
+        "evidence": {"quote": "退款通常需要三个工作日", "start_offset": 1, "end_offset": 12},
+        "core_relevance": "high",
+        "reason": "证据不匹配",
+    }
+    valid = {
+        **invalid,
+        "evidence": {"quote": "退款通常需要三个工作日", "start_offset": 0, "end_offset": 11},
+    }
+    transport = ScriptedTransport([_ok_response(invalid), _ok_response(valid)])
+
+    result = LLMProvider(_provider_config(), transport, lambda _: None).judge_claim(
+        _record(),
+        # The provider output is validated against this claim before returning.
+        __import__("src.domain.models", fromlist=["Claim"]).Claim(
+            claim_id="c1",
+            text="退款需要三个工作日",
+            source_quote="退款需要三个工作日",
+            source_start_offset=0,
+            source_end_offset=9,
+            kind="policy",
+        ),
+        _config(),
+        _budget(),
+    )
+
+    assert result.repaired is False
+    assert result.attempts == 1
+    assert result.value.evidence is not None
+    assert result.value.evidence.start_offset == 0
+    assert result.value.evidence.end_offset == 11
+
+
+def test_inconsistent_judgement_is_not_silently_downgraded() -> None:
+    invalid: dict[str, Any] = {
+        "verdict": "contradicted",
+        "labels": [],
+        "severity": None,
+        "evidence": None,
+        "core_relevance": "high",
+        "reason": "字段组合不一致",
+    }
+    transport = ScriptedTransport([_ok_response(invalid), _ok_response(invalid)])
+    claim = __import__("src.domain.models", fromlist=["Claim"]).Claim(
+        claim_id="c1",
+        text="退款需要三个工作日",
+        source_quote="退款需要三个工作日",
+        source_start_offset=0,
+        source_end_offset=9,
+        kind="policy",
+    )
+
+    with pytest.raises(ProviderFailure) as caught:
+        LLMProvider(_provider_config(), transport, lambda _: None).judge_claim(
+            _record(), claim, _config(), _budget()
+        )
+
+    assert caught.value.error_code == "invalid_structure"
+
+
+def test_unanchored_omission_evidence_is_not_silently_dropped() -> None:
+    invalid = {
+        "omissions": [
+            {
+                "missing_fact": "不存在的限制",
+                "label": "关键遗漏或歪曲",
+                "severity": "高",
+                "evidence": {"quote": "知识库没有这句话", "start_offset": 0, "end_offset": 8},
+                "core_relevance": "high",
+                "reason": "无法锚定",
+            }
+        ]
+    }
+    transport = ScriptedTransport([_ok_response(invalid), _ok_response(invalid)])
+
+    with pytest.raises(ProviderFailure) as caught:
+        LLMProvider(_provider_config(), transport, lambda _: None).find_omissions(
+            _record(), _config(), _budget()
+        )
+
+    assert caught.value.error_code == "invalid_structure"

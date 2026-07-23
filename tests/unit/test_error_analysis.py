@@ -317,6 +317,7 @@ def test_suggestion_service_saves_only_a_fully_validated_report(tmp_path: Path) 
     assert provider.analysis_calls == provider.suggestion_calls == 1
     assert service.get_report(run.id).suggestions[0].suggestion_id == "suggestion-fixed-id"
     assert (tmp_path / "runtime" / run.id / "suggestions" / "suggestion_report.json").is_file()
+    assert (tmp_path / "runtime" / run.id / "suggestions.json").is_file()
     with pytest.raises(SuggestionConflict):
         service.start(
             run.id,

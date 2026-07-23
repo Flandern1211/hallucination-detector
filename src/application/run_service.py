@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
+import logging
 import os
 from threading import Event
 from typing import Any
@@ -30,6 +31,9 @@ from src.infrastructure.in_process_executor import ExecutorBusy, InProcessExecut
 from src.infrastructure.run_registry import RunRegistry
 from src.input.loader import load_reply_batch, reply_input_hash
 from src.providers.llm_provider import ProviderConfig, ProviderConfigurationError
+
+logger = logging.getLogger("hallucination.run")
+logger.setLevel(logging.INFO)
 
 
 class RunService:
@@ -72,6 +76,12 @@ class RunService:
         self._run_ids.add(run.id)
         self._warnings[run.id] = _warnings(records)
         self._registry.transition(run.id, RunState.running)
+        logger.info(
+            "run_created run_id=%s record_count=%d model=%s",
+            run.id,
+            len(records),
+            provider_config.model,
+        )
         self._submit(run.id)
         return self._summary(run.id)
 
@@ -86,12 +96,17 @@ class RunService:
         run = self._registry.get(run_id)
         successes = sum(isinstance(item, SuccessfulPrediction) for item in run.predictions)
         failures = sum(isinstance(item, FailedPrediction) for item in run.predictions)
+        live_counts = self._detection.progress_counts(run_id)
+        if live_counts is not None and run.state is RunState.running:
+            completed_count, successes, failures = live_counts
+        else:
+            completed_count = successes + failures
         persistence_error = self._detection.persistence_error(run_id)
         return RunProgress(
             id=run.id,
             state=run.state,
             total_count=len(run.records),
-            completed_count=successes + failures,
+            completed_count=completed_count,
             success_count=successes,
             failure_count=failures,
             warnings=self._warnings.get(run_id, _warnings(run.records)),
@@ -153,9 +168,25 @@ class RunService:
         return len(self._run_ids)
 
     def _submit(self, run_id: str, record_ids: Sequence[str] | None = None) -> None:
+        logger.info(
+            "run_started run_id=%s selected_records=%s",
+            run_id,
+            len(record_ids) if record_ids else "all",
+        )
+
         def task(cancel_event: Event) -> None:
             del cancel_event
-            self._detection.execute(run_id, record_ids)
+            try:
+                snapshot = self._detection.execute(run_id, record_ids)
+                logger.info(
+                    "run_finished run_id=%s result_count=%d stopped_reason=%s",
+                    run_id,
+                    len(snapshot.results),
+                    snapshot.stopped_reason or "none",
+                )
+            except Exception:
+                logger.exception("run_failed run_id=%s", run_id)
+                raise
 
         try:
             self._futures[run_id] = self._executor.submit(run_id, task)

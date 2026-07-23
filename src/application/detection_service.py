@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+import logging
+from typing import Any, Protocol, cast
 
 from src.domain.enums import RunState
 from src.domain.models import (
@@ -17,6 +18,9 @@ from src.domain.models import (
 )
 from src.infrastructure.artifact_store import ArtifactStore
 from src.infrastructure.run_registry import RunRegistry
+from src.reporting.exporter import export_predictions
+
+logger = logging.getLogger("hallucination.run")
 
 
 class BatchDetector(Protocol):
@@ -42,16 +46,51 @@ class DetectionService:
         self._persistence_errors: dict[str, str] = {}
         self._usage: dict[str, ProviderUsage] = {}
         self._stopped_reasons: dict[str, str | None] = {}
+        self._progress: dict[str, tuple[int, int, int]] = {}
 
     def execute(self, run_id: str, record_ids: Sequence[str] | None = None) -> BatchDetectionResult:
         run = self._registry.get(run_id)
         records = self._select_records(run.records, record_ids)
-        batch = self._engine.detect_batch(list(records), self._detector)
+        total = len(records)
+
+        def on_progress(event: object) -> None:
+            completed = int(getattr(event, "completed_count", 0))
+            successes = int(getattr(event, "outcome", "") == "success")
+            previous = self._progress.get(run_id, (0, 0, 0))
+            self._progress[run_id] = (
+                completed,
+                previous[1] + successes,
+                completed - (previous[1] + successes),
+            )
+            logger.info(
+                "run_record_completed run_id=%s record=%s progress=%d/%d outcome=%s",
+                run_id,
+                getattr(event, "record_id", "unknown"),
+                completed,
+                total,
+                getattr(event, "outcome", "unknown"),
+            )
+
+        try:
+            batch = cast(Any, self._engine).detect_batch(
+                list(records), self._detector, on_progress=on_progress
+            )
+        except TypeError as error:
+            if "on_progress" not in str(error):
+                raise
+            batch = self._engine.detect_batch(list(records), self._detector)
         self._usage[run_id] = _add_usage(
             self._usage.get(run_id, _zero_usage()), batch.provider_usage
         )
         self._stopped_reasons[run_id] = batch.stopped_reason
         predictions = self._merge_predictions(run.records, run.predictions, batch.results)
+        logger.info(
+            "run_batch_completed run_id=%s total=%d successes=%d failures=%d",
+            run_id,
+            len(predictions),
+            sum(isinstance(item, SuccessfulPrediction) for item in predictions),
+            sum(isinstance(item, FailedPrediction) for item in predictions),
+        )
         self._registry.set_predictions(run_id, predictions)
         snapshot = self._snapshot(run_id)
         if all(isinstance(item, SuccessfulPrediction) for item in predictions):
@@ -76,6 +115,9 @@ class DetectionService:
     def persistence_error(self, run_id: str) -> str | None:
         return self._persistence_errors.get(run_id)
 
+    def progress_counts(self, run_id: str) -> tuple[int, int, int] | None:
+        return self._progress.get(run_id)
+
     def _snapshot(self, run_id: str) -> BatchDetectionResult:
         run = self._registry.get(run_id)
         results = list(run.predictions)
@@ -99,6 +141,11 @@ class DetectionService:
         try:
             self._artifact_store.write_json(
                 run_id, "prediction_snapshot.json", snapshot.model_dump(mode="json")
+            )
+            self._artifact_store.write_json(
+                run_id,
+                "predictions.json",
+                export_predictions({"run_id": run_id, **snapshot.model_dump(mode="json")}),
             )
         except OSError as error:
             self._persistence_errors[run_id] = str(error)

@@ -1,0 +1,1313 @@
+# Review package: acbfd69..255a1c2
+
+## Commits
+255a1c2 feat: define immutable domain contracts and canonical hashes
+
+## Files changed
+ src/domain/enums.py                   |  30 ++
+ src/domain/hashing.py                 |  26 ++
+ src/domain/models.py                  | 546 ++++++++++++++++++++++++++++++++++
+ tests/unit/test_canonical_hash.py     |  32 ++
+ tests/unit/test_claim_invariants.py   | 253 ++++++++++++++++
+ tests/unit/test_evidence_reference.py |  82 +++++
+ tests/unit/test_prediction_result.py  | 286 ++++++++++++++++++
+ 7 files changed, 1255 insertions(+)
+
+## Diff
+diff --git a/src/domain/enums.py b/src/domain/enums.py
+new file mode 100644
+index 0000000..6a0deef
+--- /dev/null
++++ b/src/domain/enums.py
+@@ -0,0 +1,30 @@
++from enum import Enum
++
++
++class HallucinationType(str, Enum):
++    knowledge_conflict = "知识冲突"
++    unsupported_fabrication = "无依据编造"
++    capability_overreach = "能力越界"
++    safety_misleading = "安全误导"
++    critical_omission_or_distortion = "关键遗漏或歪曲"
++
++
++class Severity(str, Enum):
++    high = "高"
++    medium = "中"
++    low = "低"
++
++
++class RunState(str, Enum):
++    created = "created"
++    running = "running"
++    retryable_partial = "retryable_partial"
++    frozen = "frozen"
++    abandoned = "abandoned"
++
++
++class ArtifactStatus(str, Enum):
++    not_started = "not_started"
++    running = "running"
++    completed = "completed"
++    failed = "failed"
+diff --git a/src/domain/hashing.py b/src/domain/hashing.py
+new file mode 100644
+index 0000000..17696d3
+--- /dev/null
++++ b/src/domain/hashing.py
+@@ -0,0 +1,26 @@
++from collections.abc import Mapping
++from datetime import UTC, datetime
++import hashlib
++import json
++from typing import Any
++
++
++def canonical_bytes(value: Any, exclude: frozenset[str] = frozenset()) -> bytes:
++    raw = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
++    if isinstance(raw, Mapping):
++        raw = {key: item for key, item in raw.items() if key not in exclude}
++    return json.dumps(
++        raw,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=False,
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def content_hash(value: Any, exclude: frozenset[str] = frozenset()) -> str:
++    return hashlib.sha256(canonical_bytes(value, exclude)).hexdigest()
++
++
++def utc_now() -> datetime:
++    return datetime.now(UTC)
+diff --git a/src/domain/models.py b/src/domain/models.py
+new file mode 100644
+index 0000000..45dc311
+--- /dev/null
++++ b/src/domain/models.py
+@@ -0,0 +1,546 @@
++from __future__ import annotations
++
++from collections.abc import Mapping, Sequence
++from datetime import UTC, datetime
++import re
++from typing import Annotated, Any, Literal, TypeAlias
++
++from pydantic import (
++    BaseModel,
++    ConfigDict,
++    Field,
++    field_serializer,
++    field_validator,
++    model_validator,
++)
++
++from src.domain.enums import HallucinationType, Severity
++from src.domain.hashing import content_hash
++
++
++_ILLEGAL_C0 = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
++_STABLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
++_LABEL_ORDER = {label: index for index, label in enumerate(HallucinationType)}
++
++ShortText = Annotated[str, Field(max_length=2_000)]
++ClaimText = Annotated[str, Field(max_length=5_000)]
++SummaryText = Annotated[str, Field(max_length=4_000)]
++ReplyText = Annotated[str, Field(max_length=10_000)]
++KnowledgeText = Annotated[str, Field(max_length=50_000)]
++RiskText = Annotated[str, Field(max_length=1_000)]
++
++
++def _reject_illegal_c0(value: Any) -> None:
++    if isinstance(value, str):
++        if _ILLEGAL_C0.search(value):
++            raise ValueError("strings must not contain NUL or illegal C0 control characters")
++        return
++    if isinstance(value, Mapping):
++        for key, item in value.items():
++            _reject_illegal_c0(key)
++            _reject_illegal_c0(item)
++        return
++    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
++        for item in value:
++            _reject_illegal_c0(item)
++
++
++def normalize_stable_id(value: str) -> str:
++    normalized = value.strip()
++    if _STABLE_ID.fullmatch(normalized) is None:
++        raise ValueError("id must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}")
++    return normalized
++
++
++def _validate_generated_id(value: str) -> str:
++    if value != value.strip() or _STABLE_ID.fullmatch(value) is None:
++        raise ValueError("generated id must use the stable id format without surrounding spaces")
++    return value
++
++
++def _require_non_blank(value: str, field_name: str) -> str:
++    if not value.strip():
++        raise ValueError(f"{field_name} must not be blank")
++    return value
++
++
++def _ordered_unique_labels(labels: list[HallucinationType]) -> list[HallucinationType]:
++    return sorted(set(labels), key=_LABEL_ORDER.__getitem__)
++
++
++def _utc_datetime(value: datetime) -> datetime:
++    if value.tzinfo is None or value.utcoffset() is None:
++        raise ValueError("datetime must include a timezone")
++    return value.astimezone(UTC)
++
++
++def _utc_z(value: datetime) -> str:
++    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
++
++
++class StrictModel(BaseModel):
++    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
++
++    @model_validator(mode="after")
++    def reject_illegal_control_characters(self) -> StrictModel:
++        _reject_illegal_c0(self.model_dump())
++        return self
++
++
++class ReplyRecord(StrictModel):
++    id: str
++    user_question: ReplyText
++    system_reply: ReplyText
++    knowledge_base: KnowledgeText
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def normalize_id(cls, value: Any) -> str:
++        if not isinstance(value, str):
++            raise ValueError("id must be a string")
++        return normalize_stable_id(value)
++
++    @model_validator(mode="after")
++    def require_question_and_reply(self) -> ReplyRecord:
++        _require_non_blank(self.user_question, "user_question")
++        _require_non_blank(self.system_reply, "system_reply")
++        return self
++
++
++class Claim(StrictModel):
++    claim_id: str
++    text: ClaimText
++    source_quote: ReplyText
++    source_start_offset: Annotated[int, Field(ge=0)]
++    source_end_offset: Annotated[int, Field(ge=0)]
++    kind: Literal["fact", "policy", "capability", "advice"]
++
++    @field_validator("claim_id")
++    @classmethod
++    def validate_claim_id(cls, value: str) -> str:
++        return _validate_generated_id(value)
++
++    @model_validator(mode="after")
++    def validate_offset_order(self) -> Claim:
++        if self.source_start_offset >= self.source_end_offset:
++            raise ValueError("source_end_offset must be greater than source_start_offset")
++        return self
++
++
++class EvidenceReference(StrictModel):
++    quote: KnowledgeText
++    start_offset: Annotated[int, Field(ge=0)]
++    end_offset: Annotated[int, Field(ge=0)]
++
++    @model_validator(mode="after")
++    def validate_offset_order(self) -> EvidenceReference:
++        if self.start_offset >= self.end_offset:
++            raise ValueError("end_offset must be greater than start_offset")
++        return self
++
++
++def validate_claim_quote(claim: Claim, system_reply: str) -> None:
++    if claim.source_end_offset > len(system_reply):
++        raise ValueError("source_quote offsets exceed system_reply")
++    if system_reply[claim.source_start_offset : claim.source_end_offset] != claim.source_quote:
++        raise ValueError("source_quote does not match the system_reply slice")
++
++
++def validate_evidence_quote(evidence: EvidenceReference, knowledge_base: str) -> None:
++    if evidence.end_offset > len(knowledge_base):
++        raise ValueError("quote offsets exceed knowledge_base")
++    if knowledge_base[evidence.start_offset : evidence.end_offset] != evidence.quote:
++        raise ValueError("quote does not match the knowledge_base slice")
++
++
++class ClaimJudgement(StrictModel):
++    claim: Claim
++    verdict: Literal["supported", "contradicted", "unsupported", "unverifiable"]
++    labels: list[HallucinationType]
++    severity: Severity | None
++    evidence: EvidenceReference | None
++    core_relevance: Literal["high", "medium", "low"]
++    reason: ShortText
++
++    @field_validator("labels")
++    @classmethod
++    def normalize_labels(cls, value: list[HallucinationType]) -> list[HallucinationType]:
++        return _ordered_unique_labels(value)
++
++    @model_validator(mode="after")
++    def validate_verdict_fields(self) -> ClaimJudgement:
++        if self.verdict == "supported":
++            valid = not self.labels and self.severity is None and self.evidence is not None
++        elif self.verdict == "contradicted":
++            valid = bool(self.labels) and self.severity is not None and self.evidence is not None
++        elif self.verdict == "unsupported":
++            valid = bool(self.labels) and self.severity is not None and self.evidence is None
++        else:
++            valid = not self.labels and self.severity is None and self.evidence is None
++        if not valid:
++            raise ValueError(f"fields are inconsistent with verdict {self.verdict!r}")
++        return self
++
++
++class OmissionFinding(StrictModel):
++    omission_id: str
++    missing_fact: Annotated[str, Field(max_length=2_000)]
++    label: Literal["关键遗漏或歪曲"]
++    severity: Severity
++    evidence: EvidenceReference
++    core_relevance: Literal["high", "medium", "low"]
++    reason: ShortText
++
++    @field_validator("omission_id")
++    @classmethod
++    def validate_omission_id(cls, value: str) -> str:
++        return _validate_generated_id(value)
++
++
++class ClassificationResult(StrictModel):
++    is_hallucination: bool
++    labels: list[HallucinationType]
++    primary_type: HallucinationType | None
++    severity: Severity | None
++    review_required: bool
++    claims: Annotated[list[ClaimJudgement], Field(max_length=10)]
++    omissions: list[OmissionFinding]
++    summary: SummaryText
++
++    @field_validator("labels")
++    @classmethod
++    def normalize_labels(cls, value: list[HallucinationType]) -> list[HallucinationType]:
++        return _ordered_unique_labels(value)
++
++    @model_validator(mode="after")
++    def validate_classification(self) -> ClassificationResult:
++        component_labels = [label for judgement in self.claims for label in judgement.labels]
++        component_labels.extend(
++            HallucinationType.critical_omission_or_distortion for _ in self.omissions
++        )
++        expected_labels = _ordered_unique_labels(component_labels)
++        expected_hallucination = bool(expected_labels)
++        if self.labels != expected_labels or self.is_hallucination != expected_hallucination:
++            raise ValueError(
++                "classification must match the stable union of claim and omission labels"
++            )
++
++        if expected_hallucination:
++            if self.primary_type not in self.labels or self.severity is None:
++                raise ValueError(
++                    "classification primary_type and severity are required for hallucinations"
++                )
++        elif self.primary_type is not None or self.severity is not None:
++            raise ValueError("classification primary_type and severity must be null when normal")
++
++        review_is_required = not self.claims and not self.omissions
++        review_is_required = review_is_required or any(
++            judgement.verdict == "unverifiable" for judgement in self.claims
++        )
++        if review_is_required and not self.review_required:
++            raise ValueError("review_required does not match the classification evidence state")
++        if not expected_hallucination and not review_is_required and self.review_required:
++            raise ValueError("supported-only classifications must not require review")
++        return self
++
++
++PredictionErrorCode: TypeAlias = Literal[
++    "timeout",
++    "rate_limited",
++    "provider_error",
++    "invalid_structure",
++    "claim_limit_exceeded",
++    "context_rejected",
++    "request_budget_exhausted",
++    "token_budget_exhausted",
++    "provider_usage_missing",
++    "cancelled",
++    "run_deadline_exceeded",
++]
++
++
++class SuccessfulPrediction(StrictModel):
++    kind: Literal["success"]
++    id: str
++    result: ClassificationResult
++    engine: Literal["llm"]
++    model_name: str
++    detector_version: str
++    config_hash: str
++    attempt_count: Annotated[int, Field(ge=1)]
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def normalize_id(cls, value: Any) -> str:
++        if not isinstance(value, str):
++            raise ValueError("id must be a string")
++        return normalize_stable_id(value)
++
++
++class FailedPrediction(StrictModel):
++    kind: Literal["failure"]
++    id: str
++    error_code: PredictionErrorCode
++    error_summary: str
++    attempt_count: Annotated[int, Field(ge=0)]
++    model_name: str | None
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def normalize_id(cls, value: Any) -> str:
++        if not isinstance(value, str):
++            raise ValueError("id must be a string")
++        return normalize_stable_id(value)
++
++
++PredictionResult: TypeAlias = Annotated[
++    SuccessfulPrediction | FailedPrediction, Field(discriminator="kind")
++]
++
++
++class ProviderUsage(StrictModel):
++    prompt_tokens: Annotated[int, Field(ge=0)]
++    completion_tokens: Annotated[int, Field(ge=0)]
++    total_tokens: Annotated[int, Field(ge=0)]
++
++
++class BatchDetectionResult(StrictModel):
++    schema_version: Literal["1.0"]
++    results: Annotated[list[PredictionResult], Field(min_length=1, max_length=20)]
++    input_hash: str
++    detector_config_hash: str
++    network_attempt_count: Annotated[int, Field(ge=0)]
++    provider_usage: ProviderUsage
++    stopped_reason: str | None
++
++    @model_validator(mode="after")
++    def validate_network_attempt_count(self) -> BatchDetectionResult:
++        expected = sum(result.attempt_count for result in self.results)
++        if self.network_attempt_count != expected:
++            raise ValueError("network_attempt_count must equal the sum of record attempt_count")
++        return self
++
++
++class DetectionRunConfig(StrictModel):
++    detector_version: Literal["baseline-v1"]
++    manual_review_enabled: bool = False
++    external_processing_acknowledged: Literal[True]
++
++
++class HumanReviewRevision(StrictModel):
++    schema_version: Literal["1.0"]
++    review_id: str
++    run_id: str
++    record_id: str
++    status: Literal["confirmed_correct", "corrected"]
++    source_prediction_hash: str
++    reviewed_result: ClassificationResult
++    changed_fields: list[str]
++    revision_number: Annotated[int, Field(ge=1)]
++    save_request_id: str
++    created_at_utc: datetime
++    previous_event_hash: str | None
++    event_hash: str
++
++    @field_validator("record_id", mode="before")
++    @classmethod
++    def normalize_record_id(cls, value: Any) -> str:
++        if not isinstance(value, str):
++            raise ValueError("record_id must be a string")
++        return normalize_stable_id(value)
++
++    @field_validator("created_at_utc")
++    @classmethod
++    def normalize_created_at(cls, value: datetime) -> datetime:
++        return _utc_datetime(value)
++
++    @field_serializer("created_at_utc", when_used="json")
++    def serialize_created_at(self, value: datetime) -> str:
++        return _utc_z(value)
++
++    @model_validator(mode="after")
++    def validate_event_chain(self) -> HumanReviewRevision:
++        if self.revision_number == 1 and self.previous_event_hash is not None:
++            raise ValueError("previous_event_hash must be null for revision 1")
++        if self.revision_number > 1 and self.previous_event_hash is None:
++            raise ValueError("previous_event_hash is required after revision 1")
++        expected = content_hash(self, frozenset({"event_hash"}))
++        if self.event_hash != expected:
++            raise ValueError("event_hash does not match canonical event content")
++        return self
++
++
++class GroundTruthRecord(StrictModel):
++    id: str
++    is_hallucination: bool
++    hallucination_type: str | None
++    detail: ReplyText
++    severity: Severity | None = None
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def normalize_id(cls, value: Any) -> str:
++        if not isinstance(value, str):
++            raise ValueError("id must be a string")
++        return normalize_stable_id(value)
++
++    @model_validator(mode="after")
++    def validate_ground_truth(self) -> GroundTruthRecord:
++        if self.is_hallucination:
++            if self.hallucination_type is None or not self.hallucination_type.strip():
++                raise ValueError("positive ground truth requires a non-empty hallucination_type")
++            if not self.detail.strip():
++                raise ValueError("positive ground truth requires non-empty detail")
++        elif self.hallucination_type is not None or self.severity is not None:
++            raise ValueError("normal ground truth requires null hallucination_type and severity")
++        return self
++
++
++class RiskReference(StrictModel):
++    schema_version: Literal["1.0"]
++    version: str
++    source: Literal["uploaded_ground_truth", "frozen_benchmark_map"]
++    ground_truth_hash: str
++    risk_rule_version: str
++    severity_by_positive_id: dict[str, Severity]
++    content_hash: str
++
++    @field_validator("severity_by_positive_id")
++    @classmethod
++    def validate_positive_ids(cls, value: dict[str, Severity]) -> dict[str, Severity]:
++        for record_id in value:
++            if normalize_stable_id(record_id) != record_id:
++                raise ValueError("severity_by_positive_id keys must be normalized stable ids")
++        return value
++
++    @model_validator(mode="after")
++    def validate_content_hash(self) -> RiskReference:
++        expected = content_hash(self, frozenset({"content_hash"}))
++        if self.content_hash != expected:
++            raise ValueError("content_hash does not match canonical risk reference content")
++        return self
++
++
++class BaselineDetectorConfig(StrictModel):
++    schema_version: Literal["1.0"]
++    version: Literal["baseline-v1"]
++    claim_extraction_system_prompt: str
++    evidence_judgement_system_prompt: str
++    completeness_check_system_prompt: str
++    error_analysis_system_prompt: str
++    suggestion_system_prompt: str
++    hallucination_type_definitions: dict[HallucinationType, str]
++    severity_definitions: dict[Severity, str]
++    max_claims: Literal[10]
++    temperature: Literal[0]
++    provider_response_schema_version: Literal["1.0"]
++
++    @model_validator(mode="after")
++    def validate_definition_keys(self) -> BaselineDetectorConfig:
++        if set(self.hallucination_type_definitions) != set(HallucinationType):
++            raise ValueError("hallucination_type_definitions must contain exactly all five labels")
++        if set(self.severity_definitions) != set(Severity):
++            raise ValueError("severity_definitions must contain exactly all three severities")
++        return self
++
++
++ErrorReason: TypeAlias = Literal[
++    "claim_not_extracted",
++    "evidence_misread",
++    "unsupported_boundary_too_loose",
++    "unsupported_boundary_too_strict",
++    "capability_pattern_missed",
++    "partial_support_misclassified",
++    "critical_omission_boundary",
++    "non_factual_expression_false_positive",
++    "semantic_equivalence_or_negation_error",
++]
++
++ErrorAnalysisCode: TypeAlias = Literal[
++    "timeout",
++    "rate_limited",
++    "provider_error",
++    "invalid_structure",
++    "request_budget_exhausted",
++    "token_budget_exhausted",
++    "provider_usage_missing",
++    "cancelled",
++    "run_deadline_exceeded",
++]
++
++
++class SuccessfulErrorAnalysis(StrictModel):
++    kind: Literal["success"]
++    case_ref: str
++    error_kind: Literal["false_negative", "false_positive"]
++    primary_reason: ErrorReason
++    secondary_reasons: list[ErrorReason]
++    evidence: SummaryText
++    proposed_improvement: SummaryText
++
++    @field_validator("secondary_reasons")
++    @classmethod
++    def deduplicate_secondary_reasons(cls, value: list[ErrorReason]) -> list[ErrorReason]:
++        return list(dict.fromkeys(value))
++
++    @model_validator(mode="after")
++    def validate_error_analysis(self) -> SuccessfulErrorAnalysis:
++        _require_non_blank(self.evidence, "evidence")
++        _require_non_blank(self.proposed_improvement, "proposed_improvement")
++        if self.primary_reason in self.secondary_reasons:
++            raise ValueError("secondary_reasons must not repeat primary_reason")
++        return self
++
++
++class FailedErrorAnalysis(StrictModel):
++    kind: Literal["failure"]
++    case_ref: str
++    error_code: ErrorAnalysisCode
++    error_summary: str
++
++
++ErrorAnalysis: TypeAlias = Annotated[
++    SuccessfulErrorAnalysis | FailedErrorAnalysis, Field(discriminator="kind")
++]
++
++
++class ExperimentalSuggestion(StrictModel):
++    suggestion_id: str
++    category: Literal["prompt_principle", "label_boundary", "generalized_example"]
++    target_stage: Literal["claim_extraction", "evidence_judgement", "completeness_check"]
++    rationale: SummaryText
++    proposed_change: SummaryText
++    known_risks: Annotated[list[RiskText], Field(min_length=1, max_length=10)]
++
++    @model_validator(mode="after")
++    def require_suggestion_content(self) -> ExperimentalSuggestion:
++        _require_non_blank(self.rationale, "rationale")
++        _require_non_blank(self.proposed_change, "proposed_change")
++        for risk in self.known_risks:
++            _require_non_blank(risk, "known_risks item")
++        return self
++
++
++class SuggestionReport(StrictModel):
++    schema_version: Literal["1.0"]
++    run_id: str
++    label_source: Literal["official_ground_truth", "human_revision"]
++    input_hash: str
++    prediction_hash: str
++    detector_version: Literal["baseline-v1"]
++    detector_config_hash: str
++    model_name: str
++    generated_at_utc: datetime
++    coverage: Annotated[float, Field(ge=0.0, le=1.0)]
++    warning: Literal["小样本实验性建议，不代表效果提升"]
++    analyses: list[SuccessfulErrorAnalysis]
++    suggestions: Annotated[list[ExperimentalSuggestion], Field(max_length=20)]
++
++    @field_validator("generated_at_utc")
++    @classmethod
++    def normalize_generated_at(cls, value: datetime) -> datetime:
++        return _utc_datetime(value)
++
++    @field_serializer("generated_at_utc", when_used="json")
++    def serialize_generated_at(self, value: datetime) -> str:
++        return _utc_z(value)
+diff --git a/tests/unit/test_canonical_hash.py b/tests/unit/test_canonical_hash.py
+new file mode 100644
+index 0000000..3b420ff
+--- /dev/null
++++ b/tests/unit/test_canonical_hash.py
+@@ -0,0 +1,32 @@
++from datetime import UTC
++import math
++
++import pytest
++
++from src.domain.hashing import canonical_bytes, content_hash, utc_now
++
++
++def test_canonical_hash_ignores_key_order_and_excluded_self_hash() -> None:
++    assert content_hash({"b": 2, "a": "中文"}) == content_hash({"a": "中文", "b": 2})
++    assert content_hash(
++        {"a": 1, "artifact_hash": "x"}, frozenset({"artifact_hash"})
++    ) == content_hash({"a": 1, "artifact_hash": "y"}, frozenset({"artifact_hash"}))
++
++
++def test_canonical_bytes_are_compact_utf8_and_preserve_array_order() -> None:
++    assert canonical_bytes({"值": [2, 1]}) == b'{"\xe5\x80\xbc":[2,1]}'
++    assert canonical_bytes([1, 2]) != canonical_bytes([2, 1])
++
++
++def test_canonical_bytes_reject_non_finite_numbers() -> None:
++    with pytest.raises(ValueError, match="JSON compliant"):
++        canonical_bytes({"score": math.nan})
++
++
++def test_content_hash_is_lowercase_sha256_and_utc_now_is_aware() -> None:
++    digest = content_hash({"a": 1})
++
++    assert len(digest) == 64
++    assert digest == digest.lower()
++    assert set(digest) <= set("0123456789abcdef")
++    assert utc_now().tzinfo is UTC
+diff --git a/tests/unit/test_claim_invariants.py b/tests/unit/test_claim_invariants.py
+new file mode 100644
+index 0000000..b8e96f0
+--- /dev/null
++++ b/tests/unit/test_claim_invariants.py
+@@ -0,0 +1,253 @@
++from typing import Any
++
++import pytest
++from pydantic import ValidationError
++
++from src.domain.enums import HallucinationType, Severity
++from src.domain.models import (
++    Claim,
++    ClaimJudgement,
++    ClassificationResult,
++    EvidenceReference,
++    OmissionFinding,
++    ReplyRecord,
++    validate_claim_quote,
++)
++
++
++def _claim() -> Claim:
++    return Claim(
++        claim_id="h01-c01",
++        text="支持七天退货",
++        source_quote="支持七天退货",
++        source_start_offset=3,
++        source_end_offset=9,
++        kind="policy",
++    )
++
++
++def _evidence() -> EvidenceReference:
++    return EvidenceReference(quote="七天", start_offset=0, end_offset=2)
++
++
++def _supported() -> ClaimJudgement:
++    return ClaimJudgement(
++        claim=_claim(),
++        verdict="supported",
++        labels=[],
++        severity=None,
++        evidence=_evidence(),
++        core_relevance="high",
++        reason="知识库支持",
++    )
++
++
++def test_enum_values_have_the_fixed_serialized_order() -> None:
++    assert [item.value for item in HallucinationType] == [
++        "知识冲突",
++        "无依据编造",
++        "能力越界",
++        "安全误导",
++        "关键遗漏或歪曲",
++    ]
++    assert [item.value for item in Severity] == ["高", "中", "低"]
++
++
++def test_reply_record_normalizes_only_id_and_forbids_unknown_fields() -> None:
++    record = ReplyRecord(
++        id="  h01  ", user_question=" 问题 ", system_reply=" 回复 ", knowledge_base=" 知识 "
++    )
++
++    assert record.id == "h01"
++    assert record.user_question == " 问题 "
++    assert record.system_reply == " 回复 "
++    assert record.knowledge_base == " 知识 "
++    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
++        ReplyRecord(
++            id="h01",
++            user_question="问题",
++            system_reply="回复",
++            knowledge_base="",
++            unexpected="value",  # type: ignore[call-arg]
++        )
++
++
++@pytest.mark.parametrize("record_id", ["", " bad/id ", "-leading", "a" * 129])
++def test_reply_record_rejects_unsafe_normalized_ids(record_id: str) -> None:
++    with pytest.raises(ValidationError, match="id"):
++        ReplyRecord(id=record_id, user_question="问题", system_reply="回复", knowledge_base="")
++
++
++def test_reply_text_boundaries_and_illegal_c0_are_enforced_without_truncation() -> None:
++    ReplyRecord(id="h01", user_question="q" * 10_000, system_reply="r", knowledge_base="k" * 50_000)
++    ReplyRecord(id="h02", user_question="q", system_reply="r\n\t", knowledge_base="")
++
++    for field, value in (
++        ("user_question", "q" * 10_001),
++        ("system_reply", "r" * 10_001),
++        ("knowledge_base", "k" * 50_001),
++        ("system_reply", "bad\x01reply"),
++    ):
++        values = {
++            "id": "h01",
++            "user_question": "q",
++            "system_reply": "r",
++            "knowledge_base": "",
++        }
++        values[field] = value
++        with pytest.raises(ValidationError):
++            ReplyRecord.model_validate(values)
++
++    with pytest.raises(ValidationError, match="must not be blank"):
++        ReplyRecord(id="h01", user_question=" \n ", system_reply="r", knowledge_base="")
++
++
++def test_claim_and_evidence_must_match_unicode_code_point_slices() -> None:
++    reply = "答复🙂支持七天退货"
++    claim = _claim()
++    validate_claim_quote(claim, reply)
++    with pytest.raises(ValueError, match="source_quote"):
++        validate_claim_quote(claim.model_copy(update={"source_end_offset": 8}), reply)
++
++
++def test_claim_rejects_invalid_offset_ranges_and_output_limits() -> None:
++    values = _claim().model_dump()
++    values["source_end_offset"] = values["source_start_offset"]
++    with pytest.raises(ValidationError, match="source_end_offset"):
++        Claim.model_validate(values)
++
++    Claim.model_validate({**_claim().model_dump(), "text": "x" * 5_000})
++    with pytest.raises(ValidationError, match="at most 5000"):
++        Claim.model_validate({**_claim().model_dump(), "text": "x" * 5_001})
++
++
++@pytest.mark.parametrize(
++    ("verdict", "labels", "severity", "evidence"),
++    [
++        ("supported", [], None, None),
++        ("supported", [HallucinationType("知识冲突")], None, _evidence()),
++        ("contradicted", [], Severity("高"), _evidence()),
++        ("unsupported", [HallucinationType("无依据编造")], Severity("中"), _evidence()),
++        ("unverifiable", [], Severity("低"), None),
++    ],
++)
++def test_claim_judgement_rejects_verdict_field_mismatches(
++    verdict: str,
++    labels: list[HallucinationType],
++    severity: Severity | None,
++    evidence: EvidenceReference | None,
++) -> None:
++    with pytest.raises(ValidationError, match="verdict"):
++        ClaimJudgement(
++            claim=_claim(),
++            verdict=verdict,  # type: ignore[arg-type]
++            labels=labels,
++            severity=severity,
++            evidence=evidence,
++            core_relevance="high",
++            reason="reason",
++        )
++
++
++def test_claim_labels_are_deduplicated_and_saved_in_fixed_order() -> None:
++    judgement = ClaimJudgement(
++        claim=_claim(),
++        verdict="unsupported",
++        labels=[
++            HallucinationType("能力越界"),
++            HallucinationType("知识冲突"),
++            HallucinationType("能力越界"),
++        ],
++        severity=Severity("高"),
++        evidence=None,
++        core_relevance="high",
++        reason="reason",
++    )
++
++    assert judgement.labels == [
++        HallucinationType("知识冲突"),
++        HallucinationType("能力越界"),
++    ]
++
++
++def test_classification_enforces_union_hallucination_and_primary_type() -> None:
++    labelled = ClaimJudgement(
++        claim=_claim(),
++        verdict="unsupported",
++        labels=[HallucinationType("无依据编造")],
++        severity=Severity("中"),
++        evidence=None,
++        core_relevance="high",
++        reason="reason",
++    )
++    valid = {
++        "is_hallucination": True,
++        "labels": [HallucinationType("无依据编造")],
++        "primary_type": HallucinationType("无依据编造"),
++        "severity": Severity("中"),
++        "review_required": False,
++        "claims": [labelled],
++        "omissions": [],
++        "summary": "summary",
++    }
++    ClassificationResult.model_validate(valid)
++
++    updates: tuple[dict[str, Any], ...] = (
++        {"is_hallucination": False},
++        {"labels": []},
++        {"primary_type": HallucinationType("知识冲突")},
++        {"severity": None},
++    )
++    for update in updates:
++        with pytest.raises(ValidationError, match="classification"):
++            ClassificationResult.model_validate({**valid, **update})
++
++
++def test_classification_review_rules_cover_supported_unverifiable_and_empty() -> None:
++    normal = ClassificationResult(
++        is_hallucination=False,
++        labels=[],
++        primary_type=None,
++        severity=None,
++        review_required=False,
++        claims=[_supported()],
++        omissions=[],
++        summary="normal",
++    )
++    assert normal.review_required is False
++
++    empty = normal.model_dump()
++    empty.update(claims=[], review_required=True)
++    ClassificationResult.model_validate(empty)
++    with pytest.raises(ValidationError, match="review_required"):
++        ClassificationResult.model_validate({**empty, "review_required": False})
++
++    unverifiable = _supported().model_copy(update={"verdict": "unverifiable", "evidence": None})
++    with pytest.raises(ValidationError, match="review_required"):
++        ClassificationResult.model_validate(
++            {**empty, "claims": [unverifiable], "review_required": False}
++        )
++
++
++def test_omission_forces_hallucination_and_its_label_into_the_union() -> None:
++    omission = OmissionFinding(
++        omission_id="h01-o01",
++        missing_fact="需要保留包装",
++        label="关键遗漏或歪曲",
++        severity=Severity("高"),
++        evidence=_evidence(),
++        core_relevance="high",
++        reason="遗漏重要条件",
++    )
++
++    result = ClassificationResult(
++        is_hallucination=True,
++        labels=[HallucinationType("关键遗漏或歪曲")],
++        primary_type=HallucinationType("关键遗漏或歪曲"),
++        severity=Severity("高"),
++        review_required=False,
++        claims=[],
++        omissions=[omission],
++        summary="有关键遗漏",
++    )
++    assert result.labels == [HallucinationType("关键遗漏或歪曲")]
+diff --git a/tests/unit/test_evidence_reference.py b/tests/unit/test_evidence_reference.py
+new file mode 100644
+index 0000000..a08a4e6
+--- /dev/null
++++ b/tests/unit/test_evidence_reference.py
+@@ -0,0 +1,82 @@
++import pytest
++from pydantic import ValidationError
++
++from src.domain.enums import Severity
++from src.domain.hashing import content_hash
++from src.domain.models import (
++    EvidenceReference,
++    GroundTruthRecord,
++    RiskReference,
++    validate_evidence_quote,
++)
++
++
++def test_evidence_reference_uses_unicode_code_point_offsets() -> None:
++    knowledge_base = "🙂七天内可退货"
++    evidence = EvidenceReference(quote="七天", start_offset=1, end_offset=3)
++
++    validate_evidence_quote(evidence, knowledge_base)
++    with pytest.raises(ValueError, match="quote"):
++        validate_evidence_quote(evidence.model_copy(update={"start_offset": 0}), knowledge_base)
++
++
++@pytest.mark.parametrize(("start", "end"), [(-1, 1), (1, 1), (2, 1)])
++def test_evidence_reference_rejects_invalid_offset_ranges(start: int, end: int) -> None:
++    with pytest.raises(ValidationError, match="offset"):
++        EvidenceReference(quote="x", start_offset=start, end_offset=end)
++
++
++def test_ground_truth_normalizes_id_and_enforces_label_invariants() -> None:
++    normal = GroundTruthRecord(
++        id=" h01 ", is_hallucination=False, hallucination_type=None, detail="正常"
++    )
++    assert normal.id == "h01"
++    assert normal.severity is None
++
++    GroundTruthRecord(
++        id="h02",
++        is_hallucination=True,
++        hallucination_type="外部未知类型",
++        detail="人工说明",
++        severity=None,
++    )
++    with pytest.raises(ValidationError, match="ground truth"):
++        GroundTruthRecord(
++            id="h03",
++            is_hallucination=False,
++            hallucination_type="知识冲突",
++            detail="normal",
++            severity=None,
++        )
++    with pytest.raises(ValidationError, match="ground truth"):
++        GroundTruthRecord(
++            id="h04", is_hallucination=True, hallucination_type=" ", detail=" ", severity=None
++        )
++
++
++def test_risk_reference_hash_excludes_its_own_hash_field() -> None:
++    raw = {
++        "schema_version": "1.0",
++        "version": "risk-v1",
++        "source": "uploaded_ground_truth",
++        "ground_truth_hash": "ground-truth-hash",
++        "risk_rule_version": "risk-rule-v1",
++        "severity_by_positive_id": {"h01": "高"},
++    }
++    expected_hash = content_hash(raw)
++    reference = RiskReference.model_validate(
++        {
++            **raw,
++            "severity_by_positive_id": {"h01": Severity("高")},
++            "content_hash": expected_hash,
++        }
++    )
++
++    assert reference.content_hash == expected_hash
++    with pytest.raises(ValidationError, match="content_hash"):
++        RiskReference.model_validate_json(
++            __import__("json").dumps(
++                {**reference.model_dump(mode="json"), "content_hash": "0" * 64},
++                ensure_ascii=False,
++            )
++        )
+diff --git a/tests/unit/test_prediction_result.py b/tests/unit/test_prediction_result.py
+new file mode 100644
+index 0000000..c451165
+--- /dev/null
++++ b/tests/unit/test_prediction_result.py
+@@ -0,0 +1,286 @@
++from datetime import UTC, datetime
++import json
++from typing import Any
++
++import pytest
++from pydantic import TypeAdapter, ValidationError
++
++from src.domain.enums import ArtifactStatus, HallucinationType, RunState, Severity
++from src.domain.hashing import content_hash
++from src.domain.models import (
++    BaselineDetectorConfig,
++    BatchDetectionResult,
++    ClassificationResult,
++    DetectionRunConfig,
++    ErrorAnalysis,
++    ExperimentalSuggestion,
++    FailedErrorAnalysis,
++    FailedPrediction,
++    HumanReviewRevision,
++    PredictionResult,
++    ProviderUsage,
++    SuccessfulErrorAnalysis,
++    SuccessfulPrediction,
++    SuggestionReport,
++)
++
++
++def _normal_result(*, review_required: bool = True) -> ClassificationResult:
++    return ClassificationResult(
++        is_hallucination=False,
++        labels=[],
++        primary_type=None,
++        severity=None,
++        review_required=review_required,
++        claims=[],
++        omissions=[],
++        summary="无原子声明，需要复核",
++    )
++
++
++def _success() -> SuccessfulPrediction:
++    return SuccessfulPrediction(
++        kind="success",
++        id="h01",
++        result=_normal_result(),
++        engine="llm",
++        model_name="model",
++        detector_version="baseline-v1",
++        config_hash="config-hash",
++        attempt_count=1,
++    )
++
++
++def test_state_enums_have_fixed_serialized_order() -> None:
++    assert [state.value for state in RunState] == [
++        "created",
++        "running",
++        "retryable_partial",
++        "frozen",
++        "abandoned",
++    ]
++    assert [state.value for state in ArtifactStatus] == [
++        "not_started",
++        "running",
++        "completed",
++        "failed",
++    ]
++
++
++def test_failed_prediction_rejects_classification_fields() -> None:
++    with pytest.raises(ValidationError):
++        TypeAdapter(PredictionResult).validate_python(
++            {
++                "kind": "failure",
++                "id": "h01",
++                "error_code": "timeout",
++                "error_summary": "provider timeout",
++                "attempt_count": 1,
++                "model_name": None,
++                "result": {"is_hallucination": False},
++            }
++        )
++
++
++def test_prediction_union_accepts_exact_success_and_failure_shapes() -> None:
++    adapter: TypeAdapter[PredictionResult] = TypeAdapter(PredictionResult)
++    assert adapter.validate_python(_success()).kind == "success"
++    failure = FailedPrediction(
++        kind="failure",
++        id="h02",
++        error_code="request_budget_exhausted",
++        error_summary="budget exhausted",
++        attempt_count=0,
++        model_name=None,
++    )
++    assert adapter.validate_python(failure).kind == "failure"
++
++
++def test_batch_network_attempts_must_equal_record_attempts() -> None:
++    failure = FailedPrediction(
++        kind="failure",
++        id="h02",
++        error_code="timeout",
++        error_summary="timeout",
++        attempt_count=2,
++        model_name="model",
++    )
++    values = {
++        "schema_version": "1.0",
++        "results": [_success(), failure],
++        "input_hash": "input-hash",
++        "detector_config_hash": "config-hash",
++        "network_attempt_count": 3,
++        "provider_usage": ProviderUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
++        "stopped_reason": None,
++    }
++    BatchDetectionResult.model_validate(values)
++    with pytest.raises(ValidationError, match="network_attempt_count"):
++        BatchDetectionResult.model_validate({**values, "network_attempt_count": 2})
++
++
++def test_detection_run_config_requires_literal_acknowledgement() -> None:
++    config = DetectionRunConfig(
++        detector_version="baseline-v1", external_processing_acknowledged=True
++    )
++    assert config.manual_review_enabled is False
++    with pytest.raises(ValidationError, match="external_processing_acknowledged"):
++        DetectionRunConfig.model_validate(
++            {"detector_version": "baseline-v1", "external_processing_acknowledged": False}
++        )
++
++
++def test_human_revision_validates_event_chain_hash_and_serializes_utc_as_z() -> None:
++    timestamp = datetime(2026, 7, 22, 1, 2, 3, tzinfo=UTC)
++    body = {
++        "schema_version": "1.0",
++        "review_id": "review-1",
++        "run_id": "run-1",
++        "record_id": "h01",
++        "status": "confirmed_correct",
++        "source_prediction_hash": "prediction-hash",
++        "reviewed_result": _normal_result().model_dump(mode="json"),
++        "changed_fields": [],
++        "revision_number": 1,
++        "save_request_id": "request-1",
++        "created_at_utc": "2026-07-22T01:02:03Z",
++        "previous_event_hash": None,
++    }
++    event_hash = content_hash(body)
++    revision = HumanReviewRevision(
++        schema_version="1.0",
++        review_id="review-1",
++        run_id="run-1",
++        record_id="h01",
++        status="confirmed_correct",
++        source_prediction_hash="prediction-hash",
++        reviewed_result=_normal_result(),
++        changed_fields=[],
++        revision_number=1,
++        save_request_id="request-1",
++        created_at_utc=timestamp,
++        previous_event_hash=None,
++        event_hash=event_hash,
++    )
++
++    assert revision.model_dump(mode="json")["created_at_utc"] == "2026-07-22T01:02:03Z"
++    with pytest.raises(ValidationError, match="event_hash"):
++        HumanReviewRevision.model_validate_json(
++            json.dumps(
++                {**revision.model_dump(mode="json"), "event_hash": "0" * 64},
++                ensure_ascii=False,
++            )
++        )
++    with pytest.raises(ValidationError, match="previous_event_hash"):
++        HumanReviewRevision.model_validate_json(
++            json.dumps(
++                {
++                    **revision.model_dump(mode="json"),
++                    "revision_number": 2,
++                    "previous_event_hash": None,
++                },
++                ensure_ascii=False,
++            )
++        )
++
++
++def test_baseline_config_requires_exact_definition_key_sets() -> None:
++    config: dict[str, Any] = {
++        "schema_version": "1.0",
++        "version": "baseline-v1",
++        "claim_extraction_system_prompt": "claim",
++        "evidence_judgement_system_prompt": "evidence",
++        "completeness_check_system_prompt": "omission",
++        "error_analysis_system_prompt": "analysis",
++        "suggestion_system_prompt": "suggestion",
++        "hallucination_type_definitions": {
++            item.value: f"definition-{index}"
++            for index, item in enumerate(HallucinationType, start=1)
++        },
++        "severity_definitions": {item.value: f"severity-{item.value}" for item in Severity},
++        "max_claims": 10,
++        "temperature": 0,
++        "provider_response_schema_version": "1.0",
++    }
++    BaselineDetectorConfig.model_validate_json(json.dumps(config, ensure_ascii=False))
++    label_definitions = config["hallucination_type_definitions"]
++    assert isinstance(label_definitions, dict)
++    del label_definitions["知识冲突"]
++    with pytest.raises(ValidationError, match="hallucination_type_definitions"):
++        BaselineDetectorConfig.model_validate_json(json.dumps(config, ensure_ascii=False))
++
++
++def test_error_analysis_union_and_secondary_reason_invariants() -> None:
++    analysis = SuccessfulErrorAnalysis(
++        kind="success",
++        case_ref="case-001",
++        error_kind="false_negative",
++        primary_reason="claim_not_extracted",
++        secondary_reasons=["evidence_misread", "evidence_misread"],
++        evidence="依据",
++        proposed_improvement="改进",
++    )
++    assert analysis.secondary_reasons == ["evidence_misread"]
++    assert TypeAdapter(ErrorAnalysis).validate_python(analysis).kind == "success"
++    failure = FailedErrorAnalysis(
++        kind="failure", case_ref="case-002", error_code="timeout", error_summary="timeout"
++    )
++    assert TypeAdapter(ErrorAnalysis).validate_python(failure).kind == "failure"
++    with pytest.raises(ValidationError, match="primary_reason"):
++        SuccessfulErrorAnalysis(
++            kind="success",
++            case_ref="case-001",
++            error_kind="false_negative",
++            primary_reason="claim_not_extracted",
++            secondary_reasons=["claim_not_extracted"],
++            evidence="依据",
++            proposed_improvement="改进",
++        )
++
++
++def test_suggestion_limits_and_report_contract() -> None:
++    analysis = SuccessfulErrorAnalysis(
++        kind="success",
++        case_ref="case-001",
++        error_kind="false_positive",
++        primary_reason="non_factual_expression_false_positive",
++        secondary_reasons=[],
++        evidence="依据",
++        proposed_improvement="改进",
++    )
++    suggestion = ExperimentalSuggestion(
++        suggestion_id="suggestion-001",
++        category="prompt_principle",
++        target_stage="claim_extraction",
++        rationale="理由",
++        proposed_change="变更原则",
++        known_risks=["可能过度过滤"],
++    )
++    report = SuggestionReport(
++        schema_version="1.0",
++        run_id="run-1",
++        label_source="official_ground_truth",
++        input_hash="input-hash",
++        prediction_hash="prediction-hash",
++        detector_version="baseline-v1",
++        detector_config_hash="config-hash",
++        model_name="model",
++        generated_at_utc=datetime(2026, 7, 22, tzinfo=UTC),
++        coverage=1.0,
++        warning="小样本实验性建议，不代表效果提升",
++        analyses=[analysis],
++        suggestions=[suggestion],
++    )
++    assert report.model_dump(mode="json")["generated_at_utc"].endswith("Z")
++
++    with pytest.raises(ValidationError):
++        SuggestionReport.model_validate({**report.model_dump(mode="json"), "coverage": 1.01})
++    with pytest.raises(ValidationError, match="known_risks"):
++        ExperimentalSuggestion(
++            suggestion_id="suggestion-001",
++            category="prompt_principle",
++            target_stage="claim_extraction",
++            rationale="理由",
++            proposed_change="变更原则",
++            known_risks=[],
++        )

@@ -138,6 +138,7 @@ def test_all_success_auto_freezes_and_persists_snapshot(tmp_path: Path) -> None:
     assert run.state is RunState.frozen
     assert run.success_count == 2 and run.failure_count == 0
     assert (tmp_path / "runtime" / run.id / "prediction_snapshot.json").exists()
+    assert (tmp_path / "runtime" / run.id / "predictions.json").exists()
 
 
 def test_partial_retry_only_replaces_requested_failure_before_freeze(tmp_path: Path) -> None:

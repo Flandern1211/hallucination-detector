@@ -29,7 +29,7 @@ class EvidenceJudge:
         except ValueError as exc:
             raise ProviderFailure(
                 error_code="invalid_structure",
-                error_summary="claim judgement failed local validation",
+                error_summary=f"claim judgement failed local validation: {exc}",
                 attempts=result.attempts,
                 model_name=result.model_name,
                 usage=result.usage,

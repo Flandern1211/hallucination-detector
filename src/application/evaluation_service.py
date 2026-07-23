@@ -15,6 +15,8 @@ from src.evaluation.type_mapping import TypeCompatibility
 from src.infrastructure.artifact_store import ArtifactStore
 from src.infrastructure.run_registry import RunRegistry
 from src.input.loader import load_ground_truth_batch
+from src.reporting.exporter import export_evaluation
+from src.suggestions.error_analyzer import OfficialSource
 
 
 class GroundTruthConflict(RuntimeError):
@@ -96,9 +98,26 @@ class EvaluationService:
                 raise RuntimeError("ground truth has not been loaded") from error
             result = evaluate(list(run.predictions), list(records), reference, self._type_map)
             if self._artifact_store is not None:
-                self._artifact_store.write_json(run_id, "evaluation.json", result)
+                self._artifact_store.write_json(
+                    run_id,
+                    "evaluation.json",
+                    export_evaluation({"run_id": run_id, **result.model_dump(mode="json")}),
+                )
             self._evaluations[run_id] = result
             return result
+
+    def official_source(self, run_id: str) -> OfficialSource:
+        run = self._registry.get(run_id)
+        try:
+            _, records, _ = self._ground_truth[run_id]
+        except KeyError as error:
+            raise RuntimeError("ground truth has not been loaded") from error
+        run_ids = {record.id for record in run.records}
+        selected = tuple(record for record in records if record.id in run_ids)
+        return OfficialSource(
+            labels=selected,
+            coverage=len(selected) / len(run.records),
+        )
 
 
 __all__ = ["EvaluationService", "GroundTruthConflict", "GroundTruthSummary"]
