@@ -12,23 +12,82 @@
   <body>
     <main class="shell">
       <header class="hero">
-        <div><p class="eyebrow">客服质量工作台</p><h1>客服幻觉检测</h1><p>上传一批客服回复，运行检测并查看风险、评测和复审结果。</p></div>
+        <div>
+          <p class="eyebrow">客服质量工作台</p>
+          <h1>客服幻觉检测</h1>
+          <p>上传一批客服回复，运行检测并查看风险、评测和复审结果。</p>
+          <p class="muted">支持多线程并行检测（默认5线程），提升检测效率。</p>
+        </div>
         <span class="status-dot">本地 MVP</span>
       </header>
+
       <section class="panel setup-panel">
         <h2>运行配置</h2>
         <p class="muted">LLM 配置只从环境变量读取；页面不会显示密钥。</p>
-        <label class="upload"><span>客服回复 JSON</span><input id="records-file" type="file" accept="application/json,.json"><small id="records-name">尚未选择文件</small></label>
-        <label class="upload"><span>官方标注 ground_truth.json（可选）</span><input id="ground-truth-file" type="file" accept="application/json,.json"><small id="ground-truth-name">尚未选择文件</small></label>
-        <div class="config-row"><label><input id="manual-review" type="checkbox"> 开启人工复审</label><label><input id="external-ack" type="checkbox"> 确认内容将发送到配置的外部 LLM</label></div>
+        <label class="upload">
+          <span>客服回复 JSON</span>
+          <input id="records-file" type="file" accept="application/json,.json">
+          <small id="records-name">尚未选择文件</small>
+        </label>
+        <label class="upload">
+          <span>官方标注 ground_truth.json（可选）</span>
+          <input id="ground-truth-file" type="file" accept="application/json,.json">
+          <small id="ground-truth-name">尚未选择文件</small>
+        </label>
+        <div class="config-row">
+          <label><input id="manual-review" type="checkbox"> 开启人工复审</label>
+          <label><input id="external-ack" type="checkbox"> 确认内容将发送到配置的外部 LLM</label>
+        </div>
         <button id="start-run" class="primary" type="button" onclick="window.Dashboard.startRun()">创建检测运行</button>
         <p id="form-error" class="error" role="alert"></p>
       </section>
-      <div class="grid"><section id="run-summary" class="panel" aria-live="polite"><h2>运行摘要</h2><p class="muted">尚未创建运行</p></section><section id="progress" class="panel" aria-live="polite"><h2>检测进度</h2><p class="muted">尚未开始检测</p></section></div>
-      <section id="results" class="panel"><h2>检测结果</h2><p class="muted">创建运行后，结果会显示在这里。</p></section>
-      <section id="evaluation" class="panel"><h2>评测指标</h2><p class="muted">提供官方标注后可生成评测。</p></section>
-      <section id="suggestions" class="panel"><h2>实验性建议</h2><p class="muted">建议仅供人工参考。</p></section>
-      <section id="exports" class="panel"><h2>导出</h2><div id="export-links" class="actions muted">创建运行后可下载结果文件。</div></section>
+
+      <div class="grid">
+        <section id="run-summary" class="panel" aria-live="polite">
+          <h2>运行摘要</h2>
+          <p class="muted">尚未创建运行</p>
+        </section>
+        <section id="progress" class="panel" aria-live="polite">
+          <h2>检测进度</h2>
+          <p class="muted">尚未开始检测</p>
+        </section>
+      </div>
+
+      <section id="results" class="panel">
+        <h2>检测结果</h2>
+        <p class="muted">创建运行后，结果会显示在这里。</p>
+      </section>
+
+      <section id="charts" class="panel" style="display:none;">
+        <h2>结果可视化</h2>
+        <div class="chart-grid">
+          <div id="chart-severity" class="chart-container"></div>
+          <div id="chart-type" class="chart-container"></div>
+        </div>
+      </section>
+
+      <section id="evaluation" class="panel">
+        <h2>评测指标</h2>
+        <p class="muted">提供官方标注后可生成评测。</p>
+      </section>
+
+      <section id="review" class="panel" style="display:none;">
+        <h2>人工复审</h2>
+        <div id="review-content">
+          <p class="muted">开启人工复审后，可在此确认或修正检测结果。</p>
+          <div id="review-list"></div>
+        </div>
+      </section>
+
+      <section id="suggestions" class="panel">
+        <h2>实验性建议</h2>
+        <p class="muted">建议仅供人工参考。需要100%复审覆盖率后可生成。</p>
+      </section>
+
+      <section id="exports" class="panel">
+        <h2>导出</h2>
+        <div id="export-links" class="actions muted">创建运行后可下载结果文件。</div>
+      </section>
     </main>
   </body>
 </html>

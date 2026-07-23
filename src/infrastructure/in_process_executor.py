@@ -11,8 +11,8 @@ class ExecutorBusy(RuntimeError):
 
 
 class InProcessExecutor:
-    def __init__(self) -> None:
-        self._pool = ThreadPoolExecutor(max_workers=1)
+    def __init__(self, max_workers: int = 1) -> None:
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = RLock()
         self._run_id: str | None = None
         self._cancel_event: Event | None = None

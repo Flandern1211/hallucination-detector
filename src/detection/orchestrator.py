@@ -1,5 +1,6 @@
 from collections.abc import Callable
-from threading import Event
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event, Lock
 from time import monotonic
 from typing import Any, Protocol, cast
 
@@ -45,11 +46,13 @@ class DetectionOrchestrator:
         provider: DetectionInferenceProvider,
         *,
         budget: TaskBudget | None = None,
+        max_workers: int = 5,
     ) -> None:
         self._extractor = ClaimExtractor(provider)
         self._judge = EvidenceJudge(provider)
         self._checker = CompletenessChecker(provider)
         self._budget = budget
+        self._max_workers = max_workers
 
     def detect_batch(
         self,
@@ -58,17 +61,28 @@ class DetectionOrchestrator:
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> BatchDetectionResult:
         budget = self._budget or TaskBudget(200, 250_000, 1800, monotonic, Event())
-        results: list[SuccessfulPrediction | FailedPrediction] = []
+        results: list[SuccessfulPrediction | FailedPrediction | None] = [None] * len(records)
         total_usage = ProviderUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+        usage_lock = Lock()
+        completed_count = 0
+        completed_lock = Lock()
         terminal_stop: BudgetStop | None = None
+        stop_lock = Lock()
 
-        for completed, record in enumerate(records, start=1):
-            if terminal_stop is None:
+        def process_record(index: int, record: ReplyRecord) -> None:
+            nonlocal completed_count, terminal_stop, total_usage
+            with stop_lock:
+                current_stop = terminal_stop
+
+            if current_stop is None:
                 result, usage, stop = self._detect_record(record, detector, budget)
-                total_usage = _add_usage(total_usage, usage)
-                terminal_stop = stop
+                with usage_lock:
+                    total_usage = _add_usage(total_usage, usage)
+                with stop_lock:
+                    if stop is not None and terminal_stop is None:
+                        terminal_stop = stop
             else:
-                error_code = cast(PredictionErrorCode, terminal_stop.error_code)
+                error_code = cast(PredictionErrorCode, current_stop.error_code)
                 result = FailedPrediction(
                     kind="failure",
                     id=record.id,
@@ -77,24 +91,60 @@ class DetectionOrchestrator:
                     attempt_count=0,
                     model_name=None,
                 )
-            results.append(result)
+
+            results[index] = result
+
+            with completed_lock:
+                completed_count += 1
+                current_completed = completed_count
+
             if on_progress is not None:
                 on_progress(
                     ProgressEvent(
                         record_id=record.id,
-                        completed_count=completed,
+                        completed_count=current_completed,
                         total_count=len(records),
                         outcome=result.kind,
                     )
                 )
 
+        # 并行处理记录
+        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            futures = {
+                executor.submit(process_record, i, record): i
+                for i, record in enumerate(records)
+            }
+            # 等待所有任务完成
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    # process_record 内部已处理异常，这里不应发生
+                    pass
+
+        # 确保结果顺序正确
+        final_results: list[SuccessfulPrediction | FailedPrediction] = []
+        for i, result in enumerate(results):
+            if result is None:
+                # 不应发生，但作为安全措施
+                final_results.append(FailedPrediction(
+                    kind="failure",
+                    id=records[i].id,
+                    error_code="provider_error",
+                    error_summary="record was not processed",
+                    attempt_count=0,
+                    model_name=None,
+                ))
+            else:
+                final_results.append(result)
+
         stopped_reason = terminal_stop.error_code if terminal_stop is not None else None
         return BatchDetectionResult(
             schema_version="1.0",
-            results=results,
+            results=final_results,
             input_hash=content_hash([record.model_dump(mode="json") for record in records]),
             detector_config_hash=content_hash(detector),
-            network_attempt_count=sum(item.attempt_count for item in results),
+            network_attempt_count=sum(item.attempt_count for item in final_results),
             provider_usage=total_usage,
             stopped_reason=stopped_reason,
         )

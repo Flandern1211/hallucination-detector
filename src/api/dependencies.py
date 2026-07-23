@@ -51,7 +51,7 @@ def default_container() -> ApplicationContainer:
         )
     provider = LLMProvider(config)
     engine = (
-        MockDetectionEngine() if config.model.lower() == "mock" else DetectionOrchestrator(provider)
+        MockDetectionEngine() if config.model.lower() == "mock" else DetectionOrchestrator(provider, max_workers=5)
     )
     artifact_store = ArtifactStore(Path(".runtime"))
     detection = DetectionService(registry, engine, detector, artifact_store=artifact_store)
